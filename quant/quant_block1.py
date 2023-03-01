@@ -1,0 +1,290 @@
+import torch.nn as nn
+from .quant_layer import QuantModule, UniformAffineQuantizer
+from models.resnet import BasicBlock, Bottleneck
+from models.regnet import ResBottleneckBlock
+from models.mobilenetv2 import InvertedResidual
+from models.mnasnet import _InvertedResidual
+from ldm.modules.diffusionmodules.openaimodel import (
+    TimestepBlock,
+    ResBlock
+    )
+from ldm.modules.diffusionmodules.util import (
+    checkpoint,
+    conv_nd,
+    linear,
+    avg_pool_nd,
+    zero_module,
+    normalization,
+    timestep_embedding,
+)
+from ldm.modules.attention import SpatialTransformer
+
+class BaseQuantBlock(nn.Module):
+    """
+    Base implementation of block structures for all networks.
+    Due to the branch architecture, we have to perform activation function
+    and quantization after the elemental-wise add operation, therefore, we
+    put this part in this class.
+    """
+    def __init__(self):
+        super().__init__()
+        self.use_weight_quant = False
+        self.use_act_quant = False
+        self.ignore_reconstruction = False
+
+    # 递归设置是否使用block的量化版的激活值和权重
+    def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
+        # setting weight quantization here does not affect actual forward pass
+        self.use_weight_quant = weight_quant
+        self.use_act_quant = act_quant
+        for m in self.modules():
+            if isinstance(m, QuantModule):
+                m.set_quant_state(weight_quant, act_quant)
+
+# override BasicBlock in resnet-18 and resnet-34
+class QuantBasicBlock(BaseQuantBlock):
+    """
+    Implementation of Quantized BasicBlock used in ResNet-18 and ResNet-34.
+    """
+    def __init__(self, basic_block: BasicBlock, weight_quant_params: dict = {}, act_quant_params: dict = {}):
+        super().__init__()
+        # 将conv1和conv2设置为量化版, TODO: ? conv1的激活函数保留原relu1
+        self.conv1 = QuantModule(basic_block.conv1, weight_quant_params, act_quant_params)
+        self.conv1.activation_function = basic_block.relu1
+        self.conv2 = QuantModule(basic_block.conv2, weight_quant_params, act_quant_params, disable_act_quant=True)
+
+        # 下采样与原BasicBlock相同
+        # 此处下采样就是要输出的通道数, 使得conv2的输出通道数和输入通道数相同
+        if basic_block.downsample is None:
+            self.downsample = None
+        else:
+            self.downsample = QuantModule(basic_block.downsample[0], weight_quant_params, act_quant_params,
+                                          disable_act_quant=True)
+        self.activation_function = basic_block.relu2  # 激活函数保留为原basicblock的relu2
+        self.act_quantizer = UniformAffineQuantizer(**act_quant_params)  # 激活值量化器
+
+    def forward(self, x):
+        # 如果有下采样器, 则进行下采样
+        residual = x if self.downsample is None else self.downsample(x)
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out += residual
+        out = self.activation_function(out)
+        # 是否使用激活值量化
+        if self.use_act_quant:
+            out = self.act_quantizer(out)
+        return out
+
+
+class QuantBottleneck(BaseQuantBlock):
+    """
+    Implementation of Quantized Bottleneck Block used in ResNet-50, -101 and -152.
+    """
+
+    def __init__(self, bottleneck: Bottleneck, weight_quant_params: dict = {}, act_quant_params: dict = {}):
+        super().__init__()
+        # conv1, conv2, conv3都执行量化, 激活函数暂时保留
+        self.conv1 = QuantModule(bottleneck.conv1, weight_quant_params, act_quant_params)
+        self.conv1.activation_function = bottleneck.relu1
+        self.conv2 = QuantModule(bottleneck.conv2, weight_quant_params, act_quant_params)
+        self.conv2.activation_function = bottleneck.relu2
+        self.conv3 = QuantModule(bottleneck.conv3, weight_quant_params, act_quant_params, disable_act_quant=True)
+
+        # 如果下采样器不为空, 执行下采样
+        if bottleneck.downsample is None:
+            self.downsample = None
+        else:
+            self.downsample = QuantModule(bottleneck.downsample[0], weight_quant_params, act_quant_params,
+                                          disable_act_quant=True)
+        # modify the activation function to ReLU
+        self.activation_function = bottleneck.relu3
+        # 激活值量化器
+        self.act_quantizer = UniformAffineQuantizer(**act_quant_params)
+
+    def forward(self, x):
+        # 与BasicBlock同理
+        residual = x if self.downsample is None else self.downsample(x)
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out += residual
+        out = self.activation_function(out)
+        if self.use_act_quant:
+            out = self.act_quantizer(out)
+        return out
+
+
+class QuantResBottleneckBlock(BaseQuantBlock):
+    """
+    Implementation of Quantized Bottleneck Blockused in RegNetX (no SE module).
+    """
+
+    def __init__(self, bottleneck: ResBottleneckBlock, weight_quant_params: dict = {}, act_quant_params: dict = {}):
+        super().__init__()
+        self.conv1 = QuantModule(bottleneck.f.a, weight_quant_params, act_quant_params)
+        self.conv1.activation_function = bottleneck.f.a_relu
+        self.conv2 = QuantModule(bottleneck.f.b, weight_quant_params, act_quant_params)
+        self.conv2.activation_function = bottleneck.f.b_relu
+        self.conv3 = QuantModule(bottleneck.f.c, weight_quant_params, act_quant_params, disable_act_quant=True)
+
+        if bottleneck.proj_block:
+            self.downsample = QuantModule(bottleneck.proj, weight_quant_params, act_quant_params,
+                                          disable_act_quant=True)
+        else:
+            self.downsample = None
+        # copying all attributes in original block
+        self.proj_block = bottleneck.proj_block
+
+        self.activation_function = bottleneck.relu
+        self.act_quantizer = UniformAffineQuantizer(**act_quant_params)
+
+    def forward(self, x):
+        residual = x if not self.proj_block else self.downsample(x)
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out += residual
+        out = self.activation_function(out)
+        if self.use_act_quant:
+            out = self.act_quantizer(out)
+        return out
+
+# notice: 继承的是BaseQuantBlock 而不是原模块
+class QuantResBlock(BaseQuantBlock):
+    def __init__(self, resblock: ResBlock, weight_quant_params: dict = {}, act_quant_params: dict = {}):
+        super().__init__()
+
+        self.quant_in_layers = nn.Sequential(
+            resblock.in_layers[0],
+            resblock.in_layers[1],
+            QuantModule(resblock.in_layers[2], weight_quant_params, act_quant_params),
+        )
+
+        # self.emb_layers里有if 怎么处理?
+        # config传入原模块，直接调原来的
+        self.quant_emb_layers = nn.Sequential(
+            resblock.emb_layers[0],
+            QuantModule(resblock.emb_layers[1], weight_quant_params, act_quant_params),
+        )
+
+        self.quant_out_layers = nn.Sequential(
+            resblock.out_layers[0],
+            resblock.out_layers[1],
+            resblock.out_layers[2],
+            QuantModule(resblock.out_layers[3],, weight_quant_params, act_quant_params),
+        )
+
+        # nn.Identity()
+        if resblock.out_channels == resblock.channels:
+            self.quant_skip_connection = resblock.skip_connection
+        # use_conv或者两者都不是时, skip_connection都是conv_nd
+        else:
+            self.quant_skip_connection = QuantModule(resblock.skip_connection, weight_quant_params, act_quant_params)
+
+        # 应该是self还是resblock? TODO
+        def forward(self, x, emb):
+            return checkpoint(
+                self._forward, (x, emb), resblock.parameters(), resblock.use_checkpoint
+            )
+
+        def _forward(self, x, emb):
+            if resblock.updown:
+                quant_in_rest, quant_in_conv = self.quant_in_layers[:-1], self.quant_in_layers[-1]
+                h = quant_in_rest(x)
+
+                # upd没动
+                h = resblock.h_upd(h)
+                x = resblock.x_upd(x)
+
+                h = quant_in_conv(h)
+            else:
+                h = self.quant_in_layers(x)
+
+            emb_out = self.quant_emb_layers(emb).type(h.dtype)
+            # 对齐没动
+            while len(emb_out.shape) < len(h.shape):
+                emb_out = emb_out[..., None]
+
+            if resblock.use_scale_shift_norm:
+                out_norm, out_rest = self.quant_out_layers[0], self.quant_out_layers[1:]
+                scale, shift = th.chunk(emb_out, 2, dim=1)
+                h = out_norm(h) * (1 + scale) + shift
+                h = out_rest(h)
+            else:
+                h = h + emb_out
+                h = self.quant_out_layers(h)
+
+            out = self.quant_skip_connection(x) + h
+            if self.use_act_quant:
+                out = self.act_quantizer(out)
+            return out
+
+
+class QuantInvertedResidual(BaseQuantBlock):
+    """
+    Implementation of Quantized Inverted Residual Block used in MobileNetV2.
+    Inverted Residual does not have activation function.
+    """
+
+    def __init__(self, inv_res: InvertedResidual, weight_quant_params: dict = {}, act_quant_params: dict = {}):
+        super().__init__()
+
+        self.use_res_connect = inv_res.use_res_connect
+        self.expand_ratio = inv_res.expand_ratio
+        if self.expand_ratio == 1:
+            self.conv = nn.Sequential(
+                QuantModule(inv_res.conv[0], weight_quant_params, act_quant_params),
+                QuantModule(inv_res.conv[3], weight_quant_params, act_quant_params, disable_act_quant=True),
+            )
+            self.conv[0].activation_function = nn.ReLU6()
+        else:
+            self.conv = nn.Sequential(
+                QuantModule(inv_res.conv[0], weight_quant_params, act_quant_params),
+                QuantModule(inv_res.conv[3], weight_quant_params, act_quant_params),
+                QuantModule(inv_res.conv[6], weight_quant_params, act_quant_params, disable_act_quant=True),
+            )
+            self.conv[0].activation_function = nn.ReLU6()
+            self.conv[1].activation_function = nn.ReLU6()
+        self.act_quantizer = UniformAffineQuantizer(**act_quant_params)
+
+    def forward(self, x):
+        if self.use_res_connect:
+            out = x + self.conv(x)
+        else:
+            out = self.conv(x)
+        if self.use_act_quant:
+            out = self.act_quantizer(out)
+        return out
+
+
+class _QuantInvertedResidual(BaseQuantBlock):
+    def __init__(self, _inv_res: _InvertedResidual, weight_quant_params: dict = {}, act_quant_params: dict = {}):
+        super().__init__()
+
+        self.apply_residual = _inv_res.apply_residual
+        self.conv = nn.Sequential(
+            QuantModule(_inv_res.layers[0], weight_quant_params, act_quant_params),
+            QuantModule(_inv_res.layers[3], weight_quant_params, act_quant_params),
+            QuantModule(_inv_res.layers[6], weight_quant_params, act_quant_params, disable_act_quant=True),
+        )
+        self.conv[0].activation_function = nn.ReLU()
+        self.conv[1].activation_function = nn.ReLU()
+        self.act_quantizer = UniformAffineQuantizer(**act_quant_params)
+
+    def forward(self, x):
+        if self.apply_residual:
+            out = x + self.conv(x)
+        else:
+            out = self.conv(x)
+        if self.use_act_quant:
+            out = self.act_quantizer(out)
+        return out
+
+
+specials = {
+    BasicBlock: QuantBasicBlock,
+    Bottleneck: QuantBottleneck,
+    ResBottleneckBlock: QuantResBottleneckBlock,
+    InvertedResidual: QuantInvertedResidual,
+    _InvertedResidual: _QuantInvertedResidual,
+}
