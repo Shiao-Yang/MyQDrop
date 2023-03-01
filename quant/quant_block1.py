@@ -4,12 +4,12 @@ from models.resnet import BasicBlock, Bottleneck
 from models.regnet import ResBottleneckBlock
 from models.mobilenetv2 import InvertedResidual
 from models.mnasnet import _InvertedResidual
-from ldm.modules.diffusionmodules.openaimodel import (
+from models.StableDiffusion.ldm.modules.diffusionmodules.openaimodel import (
     TimestepBlock,
     ResBlock,
     )
 
-from ldm.modules.diffusionmodules.util import (
+from models.StableDiffusion.ldm.modules.diffusionmodules.util import (
     checkpoint,
     conv_nd,
     linear,
@@ -19,7 +19,7 @@ from ldm.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 
-from ldm.modules.attention import (
+from models.StableDiffusion.ldm.modules.attention import (
     default,
     exists,
     CrossAttention,
@@ -178,7 +178,7 @@ class QuantResBlock(BaseQuantBlock):
             resblock.out_layers[0],
             resblock.out_layers[1],
             resblock.out_layers[2],
-            QuantModule(resblock.out_layers[3],, weight_quant_params, act_quant_params),
+            QuantModule(resblock.out_layers[3], weight_quant_params, act_quant_params),
         )
 
         # nn.Identity()
@@ -230,12 +230,12 @@ class QuantCrossAttention(BaseQuantBlock):
     def __init__(self, crossattention: CrossAttention, weight_quant_params: dict = {}, act_quant_params: dict = {}):
         super().__init__()
 
-        self.quant_to_q = QuantModule(crossattention.to_q,, weight_quant_params, act_quant_params)
-        self.quant_to_k = QuantModule(crossattention.to_k,, weight_quant_params, act_quant_params)
-        self.quant_to_v = QuantModule(crossattention.to_v,, weight_quant_params, act_quant_params)
+        self.quant_to_q = QuantModule(crossattention.to_q, weight_quant_params, act_quant_params)
+        self.quant_to_k = QuantModule(crossattention.to_k, weight_quant_params, act_quant_params)
+        self.quant_to_v = QuantModule(crossattention.to_v, weight_quant_params, act_quant_params)
 
         self.quant_to_out = nn.Sequential(
-            QuantModule(crossattention.to_out[0],, weight_quant_params, act_quant_params),
+            QuantModule(crossattention.to_out[0], weight_quant_params, act_quant_params),
             crossattention.to_out[1],
         )
 
@@ -278,7 +278,7 @@ class QuantFeedForward(BaseQuantBlock):
             feedforward.net[0][2],
             feedforward.net[1],
             QuantModule(feedforward.net[2], weight_quant_params, act_quant_params),
-        )   if len(feedforward.net[0]) = 2 else nn.Sequential(
+        )   if len(feedforward.net[0]) == 2 else nn.Sequential(
             feedforward.net[0],
             feedforward.net[1],
             QuantModule(feedforward.net[2], weight_quant_params, act_quant_params),
@@ -293,9 +293,9 @@ class QuantBasicTransformerBlock(BaseQuantBlock):
         super().__init__()
 
         # 量化模块调量化模块的传入参数 TODO
-        self.quant_attn1 = QuantCrossAttention(crossattention: CrossAttention, weight_quant_params, act_quant_params)
-        self.quant_ff = QuantFeedForward(feedforward: FeedForward, weight_quant_params, act_quant_params)
-        self.quant_attn2 = QuantCrossAttention(crossattention: CrossAttention, weight_quant_params, act_quant_params)
+        self.quant_attn1 = QuantCrossAttention(CrossAttention, weight_quant_params, act_quant_params)
+        self.quant_ff = QuantFeedForward(FeedForward, weight_quant_params, act_quant_params)
+        self.quant_attn2 = QuantCrossAttention(CrossAttention, weight_quant_params, act_quant_params)
 
     # 和上文一样：parameters应该用谁的? checkpoint? TODO
     def forward(self, x, context=None):
