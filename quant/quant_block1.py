@@ -1,4 +1,5 @@
 import torch.nn as nn
+from einops import rearrange
 from .quant_layer import QuantModule, UniformAffineQuantizer
 from models.resnet import BasicBlock, Bottleneck
 from models.regnet import ResBottleneckBlock
@@ -161,6 +162,12 @@ class QuantResBlock(BaseQuantBlock):
     def __init__(self, resblock: ResBlock, weight_quant_params: dict = {}, act_quant_params: dict = {}):
         super().__init__()
 
+        self.checkpoint = resblock.checkpoint
+        self.use_scale_shift_norm = resblock.use_scale_shift_norm
+        self.updown = resblock.updown
+        self.h_upd = resblock.h_upd
+        self.x_upd = resblock.x_upd
+
         self.quant_in_layers = nn.Sequential(
             resblock.in_layers[0],
             resblock.in_layers[1],
@@ -189,46 +196,49 @@ class QuantResBlock(BaseQuantBlock):
             self.quant_skip_connection = QuantModule(resblock.skip_connection, weight_quant_params, act_quant_params)
 
         # 应该是self还是resblock? weight_quant_params? TODO
-        def forward(self, x, emb):
-            return checkpoint(
-                self._forward, (x, emb), resblock.parameters(), resblock.use_checkpoint
-            )
+    def forward(self, x, emb):
+        return checkpoint(
+            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+        )
 
-        def _forward(self, x, emb):
-            if resblock.updown:
-                quant_in_rest, quant_in_conv = self.quant_in_layers[:-1], self.quant_in_layers[-1]
-                h = quant_in_rest(x)
+    def _forward(self, x, emb):
+        if self.updown:
+            quant_in_rest, quant_in_conv = self.quant_in_layers[:-1], self.quant_in_layers[-1]
+            h = quant_in_rest(x)
 
-                # upd没动
-                h = resblock.h_upd(h)
-                x = resblock.x_upd(x)
+            # upd没动
+            h = self.h_upd(h)
+            x = self.x_upd(x)
 
-                h = quant_in_conv(h)
-            else:
-                h = self.quant_in_layers(x)
+            h = quant_in_conv(h)
+        else:
+            h = self.quant_in_layers(x)
 
-            emb_out = self.quant_emb_layers(emb).type(h.dtype)
-            # 对齐没动
-            while len(emb_out.shape) < len(h.shape):
-                emb_out = emb_out[..., None]
+        emb_out = self.quant_emb_layers(emb).type(h.dtype)
+        # 对齐没动
+        while len(emb_out.shape) < len(h.shape):
+            emb_out = emb_out[..., None]
 
-            if resblock.use_scale_shift_norm:
-                out_norm, out_rest = self.quant_out_layers[0], self.quant_out_layers[1:]
-                scale, shift = th.chunk(emb_out, 2, dim=1)
-                h = out_norm(h) * (1 + scale) + shift
-                h = out_rest(h)
-            else:
-                h = h + emb_out
-                h = self.quant_out_layers(h)
+        if self.use_scale_shift_norm:
+            out_norm, out_rest = self.quant_out_layers[0], self.quant_out_layers[1:]
+            scale, shift = th.chunk(emb_out, 2, dim=1)
+            h = out_norm(h) * (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = h + emb_out
+            h = self.quant_out_layers(h)
 
-            out = self.quant_skip_connection(x) + h
-            if self.use_act_quant:
-                out = self.act_quantizer(out)
-            return out
+        out = self.quant_skip_connection(x) + h
+        if self.use_act_quant:
+            out = self.act_quantizer(out)
+        return out
 
 class QuantCrossAttention(BaseQuantBlock):
     def __init__(self, crossattention: CrossAttention, weight_quant_params: dict = {}, act_quant_params: dict = {}):
         super().__init__()
+
+        self.scale = crossattention.scale
+        self.heads = crossattention.heads
 
         self.quant_to_q = QuantModule(crossattention.to_q, weight_quant_params, act_quant_params)
         self.quant_to_k = QuantModule(crossattention.to_k, weight_quant_params, act_quant_params)
@@ -240,7 +250,7 @@ class QuantCrossAttention(BaseQuantBlock):
         )
 
     def forward(self, x, context=None, mask=None):
-        h = crossattention.heads
+        h = self.heads
 
         q = self.quant_to_q(x)
         context = default(context, x)
@@ -249,7 +259,7 @@ class QuantCrossAttention(BaseQuantBlock):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * crossattention.scale
+        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
@@ -266,9 +276,6 @@ class QuantCrossAttention(BaseQuantBlock):
 
         out = self.quant_to_out(out)
 
-        if self.use_act_quant:
-            out = self.act_quantizer(out)
-        return out
 
 class QuantFeedForward(BaseQuantBlock):
     def __init__(self, feedforward: FeedForward, weight_quant_params: dict = {}, act_quant_params: dict = {}):
@@ -297,14 +304,23 @@ class QuantBasicTransformerBlock(BaseQuantBlock):
         self.quant_ff = QuantFeedForward(FeedForward, weight_quant_params, act_quant_params)
         self.quant_attn2 = QuantCrossAttention(CrossAttention, weight_quant_params, act_quant_params)
 
+        self.norm1 = basictransformerblock.norm1
+        self.norm2 = basictransformerblock.norm2
+        self.norm3 = basictransformerblock.norm3
+
+        self.checkpoint = basictransformerblock.checkpoint
+
     # 和上文一样：parameters应该用谁的? checkpoint? TODO
     def forward(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(), basictransformerblock.checkpoint)
+        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
 
     def _forward(self, x, context=None):
-        x = self.quant_attn1(basictransformerblock.norm1(x)) + x
-        x = self.quant_attn2(basictransformerblock.norm2(x), context=context) + x
-        x = self.quant_ff(basictransformerblock.norm3(x)) + x
+        x = self.quant_attn1(self.norm1(x)) + x
+        x = self.quant_attn2(self.norm2(x), context=context) + x
+        x = self.quant_ff(self.norm3(x)) + x
+
+        # if self.use_act_quant:
+        #     x = self.act_quantizer(x)
         return x
 
 class QuantSpatialTransformer(BaseQuantBlock):
@@ -312,9 +328,37 @@ class QuantSpatialTransformer(BaseQuantBlock):
                  act_quant_params: dict = {}):
         super().__init__()
 
+        self.norm = spatialtransformer.norm
         self.quant_proj_in = QuantModule(spatialtransformer.proj_in, weight_quant_params, act_quant_params),
 
         # TODO: hard
+        self.quant_transformer_blocks = nn.ModuleList()
+        for block in spatialtransformer.transformer_blocks:
+            self.quant_transformer_blocks.append(
+                QuantModule(block, weight_quant_params, act_quant_params)
+            )
+
+        self.quant_proj_out = QuantModule(spatialtransformer.proj_out, weight_quant_params, act_quant_params)
+
+    def forward(self, x, context=None):
+        b, c, h, w = x.shape
+        x_in = x
+        x = self.norm(x)
+        x = self.quant_proj_in(x)
+
+        x = rearrange(x, 'b c h w -> b (h w) c')
+
+        for block in self.quant_transformer_blocks:
+            x = block(x, context=context)
+
+        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+        x = self.quant_proj_out(x)
+
+        # out = x + x_in
+        # if self.use_act_quant:
+        #     out = self.act_quantizer(out)
+        # return out
+        return x + x_in
 
 
 class QuantInvertedResidual(BaseQuantBlock):
