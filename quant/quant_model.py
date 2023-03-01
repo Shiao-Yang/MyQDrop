@@ -26,7 +26,7 @@ class QuantModel(nn.Module):
         for name, child_module in module.named_children():
             # 如果是specials中的模块, 则用量化后的模块替换原模块
             if type(child_module) in specials:
-                setattr(module, name, specials[type(child_module)](child_module, weight_quant_params, act_quant_params)) # specials[]后的括号是初始化类的参数
+                setattr(module, name, specials[type(child_module)](child_module, weight_quant_params, act_quant_params))  # specials[]后的括号是初始化类的参数
 
             # 如果是Conv2d或Linear, 用QuantModule替换原module, 并将prev_quantmodule设置为替换后的QuantModule.
             # QuantModule: 可以执行量化版的卷积或普通卷积
@@ -34,7 +34,7 @@ class QuantModel(nn.Module):
                 setattr(module, name, QuantModule(child_module, weight_quant_params, act_quant_params))
                 prev_quantmodule = getattr(module, name)
 
-            # 如果是ReLU或ReLU6, 且prev_quantmodule是量化版的Conv2d或Linear, ?:设置prev_quantmodule.activation_function为STE
+            # 如果是ReLU或ReLU6, 且prev_quantmodule是量化版的Conv2d或Linear, 设置prev_quantmodule.activation_function为relu/relu6, 去掉原relu
             # TODO: figure out the meaning
             elif isinstance(child_module, (nn.ReLU, nn.ReLU6)):
                 if prev_quantmodule is not None:

@@ -4,6 +4,7 @@ from models.resnet import BasicBlock, Bottleneck
 from models.regnet import ResBottleneckBlock
 from models.mobilenetv2 import InvertedResidual
 from models.mnasnet import _InvertedResidual
+from models.StableDiffusion.ldm.modules.diffusionmodules.openaimodel import
 
 
 class BaseQuantBlock(nn.Module):
